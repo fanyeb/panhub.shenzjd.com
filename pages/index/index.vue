@@ -2,7 +2,7 @@
   <div class="home">
     <header class="hero">
       <div class="hero__logo">
-        <img src="/logo.jpg" alt="logo" />
+        <img src="/logo.png" alt="logo" />
       </div>
       <div class="hero__subtitle">全网最全的网盘搜索工具</div>
     </header>
@@ -138,13 +138,15 @@ const expandedSet = ref<Set<string>>(new Set());
 // 设置相关
 const openSettings = ref(false);
 interface UserSettings {
-  enableTG: boolean;
-  tgChannels: string; // 逗号分隔，可为空
+  enabledTgChannels: string[];
   enabledPlugins: string[]; // 选中的插件名
+  concurrency: number;
+  pluginTimeoutMs: number;
 }
 const DEFAULT_SETTINGS: UserSettings = {
-  enableTG: false,
-  tgChannels: "",
+  enabledTgChannels: [
+    ...(((config.public as any)?.tgDefaultChannels || []) as string[]),
+  ],
   enabledPlugins: [
     "pansearch",
     "pan666",
@@ -166,6 +168,8 @@ const DEFAULT_SETTINGS: UserSettings = {
     "panyq",
     "shandian",
   ],
+  concurrency: 4,
+  pluginTimeoutMs: 5000,
 };
 const settings = ref<UserSettings>({ ...DEFAULT_SETTINGS });
 const LS_KEY = "panhub.settings";
@@ -177,11 +181,20 @@ function loadSettings() {
     const parsed = JSON.parse(raw);
     if (!parsed || typeof parsed !== "object") return;
     const s: UserSettings = {
-      enableTG: !!parsed.enableTG,
-      tgChannels: String(parsed.tgChannels || ""),
+      enabledTgChannels: Array.isArray(parsed.enabledTgChannels)
+        ? parsed.enabledTgChannels.filter((x: any) => typeof x === "string")
+        : [],
       enabledPlugins: Array.isArray(parsed.enabledPlugins)
         ? parsed.enabledPlugins.filter((x: any) => typeof x === "string")
         : [...ALL_PLUGIN_NAMES],
+      concurrency:
+        typeof parsed.concurrency === "number" && parsed.concurrency > 0
+          ? Math.min(16, Math.max(1, parsed.concurrency))
+          : 4,
+      pluginTimeoutMs:
+        typeof parsed.pluginTimeoutMs === "number" && parsed.pluginTimeoutMs > 0
+          ? parsed.pluginTimeoutMs
+          : 5000,
     };
     s.enabledPlugins = s.enabledPlugins.filter((n) =>
       ALL_PLUGIN_NAMES.includes(n)
@@ -256,6 +269,15 @@ function mergeMergedByType(
 }
 
 let searchSeq = 0; // 取消旧搜索用
+const activeControllers: AbortController[] = [];
+function cancelActiveRequests() {
+  for (const c of activeControllers) {
+    try {
+      c.abort();
+    } catch {}
+  }
+  activeControllers.length = 0;
+}
 
 // 已移除热搜相关功能
 
@@ -370,11 +392,16 @@ async function copyLink(url: string) {
 // 失效标记功能暂时移除（无真实接口）
 
 function resetSearch() {
+  // 取消进行中的请求并阻止老搜索写回
+  cancelActiveRequests();
+  searchSeq++;
   kw.value = "";
   merged.value = {};
   total.value = 0;
   searched.value = false;
   error.value = "";
+  loading.value = false;
+  deepLoading.value = false;
 }
 
 // 热搜功能暂时移除（无真实接口）
@@ -400,80 +427,186 @@ async function onSearch() {
     const enabledPlugins = settings.value.enabledPlugins.filter((n) =>
       ALL_PLUGIN_NAMES.includes(n)
     );
-    if (!settings.value.enableTG && enabledPlugins.length === 0) {
+    if (
+      (settings.value.enabledTgChannels?.length || 0) === 0 &&
+      enabledPlugins.length === 0
+    ) {
       throw new Error("请先在设置中选择至少一个搜索来源");
     }
 
-    // 1. 快速搜索（选中插件中的前 3 个），并行 TG
-    const fastPluginsArr = enabledPlugins.slice(0, 3);
-    const fastPlugins = fastPluginsArr.join(",");
-    const fastQuery: Record<string, any> = {
-      kw: kw.value,
-      res: "merged_by_type",
-      src: "plugin",
-      plugins: fastPlugins,
-      conc: 3,
+    // 工具：把逗号分隔字符串转成数组
+    const parseList = (s: string | undefined): string[] => {
+      if (!s) return [];
+      return s
+        .split(",")
+        .map((x) => x.trim())
+        .filter((x) => !!x);
     };
-    const fastPromise = fastPluginsArr.length
-      ? $fetch<GenericResponse<SearchResponse>>(`${apiBase}/search`, {
-          method: "GET",
-          query: fastQuery,
-        } as any)
-      : Promise.resolve({ data: { total: 0, merged_by_type: {} } } as any);
 
-    const tgPromise = settings.value.enableTG
-      ? $fetch<GenericResponse<SearchResponse>>(`${apiBase}/search`, {
-          method: "GET",
-          query: {
-            kw: kw.value,
-            res: "merged_by_type",
-            src: "tg",
-            channels: settings.value.tgChannels || undefined,
-          },
-        } as any)
-      : Promise.resolve({ data: { total: 0, merged_by_type: {} } } as any);
+    // 1) 快速搜索：按“并发数 conc”选择同等数量的插件进行首批请求
+    const conc = Math.min(
+      16,
+      Math.max(1, Number(settings.value.concurrency || 3))
+    );
+    const batchSize = conc; // 单批插件数量 = 并发数
+    const fastPluginsArr = enabledPlugins.slice(0, conc);
+    const userTgChannels = settings.value.enabledTgChannels || [];
+    const tgBatched = userTgChannels.length > 0;
+    const fastTgArr = tgBatched ? userTgChannels.slice(0, batchSize) : [];
 
-    const [fastResp, tgResp] = await Promise.all([fastPromise, tgPromise]);
-    const fastData = (fastResp as any)?.data as SearchResponse | undefined;
-    const tgData = (tgResp as any)?.data as SearchResponse | undefined;
+    const fastPromises: Array<Promise<any>> = [];
+    if (fastPluginsArr.length) {
+      fastPromises.push(
+        (() => {
+          const ac = new AbortController();
+          activeControllers.push(ac);
+          return $fetch<GenericResponse<SearchResponse>>(`${apiBase}/search`, {
+            method: "GET",
+            query: {
+              kw: kw.value,
+              res: "merged_by_type",
+              src: "plugin",
+              plugins: fastPluginsArr.join(","),
+              conc: conc,
+              ext: JSON.stringify({
+                __plugin_timeout_ms: settings.value.pluginTimeoutMs || 5000,
+              }),
+            },
+            signal: ac.signal,
+          } as any);
+        })()
+      );
+    } else {
+      fastPromises.push(
+        Promise.resolve({ data: { total: 0, merged_by_type: {} } } as any)
+      );
+    }
+    if (userTgChannels.length > 0) {
+      if (fastTgArr.length) {
+        fastPromises.push(
+          (() => {
+            const ac = new AbortController();
+            activeControllers.push(ac);
+            return $fetch<GenericResponse<SearchResponse>>(
+              `${apiBase}/search`,
+              {
+                method: "GET",
+                query: {
+                  kw: kw.value,
+                  res: "merged_by_type",
+                  src: "tg",
+                  channels: fastTgArr.join(","),
+                  conc: conc,
+                  ext: JSON.stringify({
+                    __plugin_timeout_ms: settings.value.pluginTimeoutMs || 5000,
+                  }),
+                },
+                signal: ac.signal,
+              } as any
+            );
+          })()
+        );
+      }
+    }
+
+    const [fastPluginResp, fastTgResp] = await Promise.all(fastPromises);
+    const fastPluginData = (fastPluginResp as any)?.data as
+      | SearchResponse
+      | undefined;
+    const fastTgData = (fastTgResp as any)?.data as SearchResponse | undefined;
     merged.value = mergeMergedByType(
-      mergeMergedByType({}, fastData?.merged_by_type),
-      tgData?.merged_by_type
+      mergeMergedByType({}, fastPluginData?.merged_by_type),
+      fastTgData?.merged_by_type
     );
     total.value = Object.values(merged.value).reduce(
       (sum, arr) => sum + (arr?.length || 0),
       0
     );
 
-    // 2. 持续深度搜索：每批 3 个插件，直至全部覆盖
-    const rest = enabledPlugins.slice(3);
+    // 2) 持续深度搜索：插件按“并发数”为批大小推进；TG 仍按 3 个一批
+    const restPlugins = enabledPlugins.slice(3);
+    const pluginBatches: string[][] = [];
+    for (let i = 0; i < restPlugins.length; i += batchSize) {
+      pluginBatches.push(restPlugins.slice(i, i + batchSize));
+    }
+    const tgRest = tgBatched ? userTgChannels.slice(batchSize) : [];
+    const tgBatches: string[][] = [];
+    for (let i = 0; i < tgRest.length; i += batchSize) {
+      tgBatches.push(tgRest.slice(i, i + batchSize));
+    }
+
     deepLoading.value = true;
-    for (let i = 0; i < rest.length; i += 3) {
-      if (mySeq !== searchSeq) break; // 新搜索发起，取消旧循环
-      const batch = rest.slice(i, i + 3);
-      const deepQuery: Record<string, any> = {
-        kw: kw.value,
-        res: "merged_by_type",
-        src: "plugin",
-        plugins: batch.join(","),
-        conc: 3,
-      };
-      try {
-        const resp = await $fetch<GenericResponse<SearchResponse>>(
-          `${apiBase}/search`,
-          { method: "GET", query: deepQuery } as any
+    const maxLen = Math.max(pluginBatches.length, tgBatches.length);
+    for (let i = 0; i < maxLen; i++) {
+      if (mySeq !== searchSeq) break;
+      const reqs: Array<Promise<any>> = [];
+      const pb = pluginBatches[i];
+      if (pb && pb.length) {
+        reqs.push(
+          (() => {
+            const ac = new AbortController();
+            activeControllers.push(ac);
+            return $fetch<GenericResponse<SearchResponse>>(
+              `${apiBase}/search`,
+              {
+                method: "GET",
+                query: {
+                  kw: kw.value,
+                  res: "merged_by_type",
+                  src: "plugin",
+                  plugins: pb.join(","),
+                  conc: conc,
+                  ext: JSON.stringify({
+                    __plugin_timeout_ms: settings.value.pluginTimeoutMs || 5000,
+                  }),
+                },
+                signal: ac.signal,
+              } as any
+            );
+          })()
         );
-        const d = resp?.data as SearchResponse | undefined;
-        if (!d || mySeq !== searchSeq) break;
-        // 增量合并
-        merged.value = mergeMergedByType(merged.value, d.merged_by_type);
-        // 重新计算总数
+      }
+      const tb = tgBatches[i];
+      if (tb && tb.length) {
+        reqs.push(
+          (() => {
+            const ac = new AbortController();
+            activeControllers.push(ac);
+            return $fetch<GenericResponse<SearchResponse>>(
+              `${apiBase}/search`,
+              {
+                method: "GET",
+                query: {
+                  kw: kw.value,
+                  res: "merged_by_type",
+                  src: "tg",
+                  channels: tb.join(","),
+                  conc: conc,
+                  ext: JSON.stringify({
+                    __plugin_timeout_ms: settings.value.pluginTimeoutMs || 5000,
+                  }),
+                },
+                signal: ac.signal,
+              } as any
+            );
+          })()
+        );
+      }
+
+      if (!reqs.length) continue;
+      try {
+        const resps = await Promise.all(reqs);
+        for (const r of resps) {
+          const d = (r as any)?.data as SearchResponse | undefined;
+          if (!d || mySeq !== searchSeq) continue;
+          merged.value = mergeMergedByType(merged.value, d.merged_by_type);
+        }
         total.value = Object.values(merged.value).reduce(
           (sum, arr) => sum + (arr?.length || 0),
           0
         );
       } catch {
-        // 忽略单批错误，继续下一批
+        // 单批失败忽略
       }
     }
     deepLoading.value = false;
@@ -514,8 +647,8 @@ onMounted(() => {
   background: linear-gradient(180deg, #fafafa, #f6faff);
 }
 .hero__logo img {
-  width: 200px;
-  height: 200px;
+  width: 150px;
+  height: 128px;
 }
 .hero__subtitle {
   color: #666;

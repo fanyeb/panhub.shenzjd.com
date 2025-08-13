@@ -4,7 +4,6 @@
       <nav class="nav">
         <NuxtLink to="/" class="brand">PanHub</NuxtLink>
         <div class="spacer" />
-        <NuxtLink to="/api" class="link">API</NuxtLink>
         <button class="link" type="button" @click="openSettings = true">
           设置
         </button>
@@ -18,6 +17,7 @@
         v-model="settings"
         v-model:open="openSettings"
         :all-plugins="ALL_PLUGIN_NAMES"
+        :all-tg-channels="TG_DEFAULT_CHANNELS"
         @save="onSaveSettings"
         @reset-default="resetToDefault" />
     </ClientOnly>
@@ -51,9 +51,10 @@ const ALL_PLUGIN_NAMES = [
 ];
 
 type UserSettings = {
-  enableTG: boolean;
-  tgChannels: string;
+  enabledTgChannels: string[];
   enabledPlugins: string[];
+  concurrency: number;
+  pluginTimeoutMs: number;
 };
 
 const openSettings = ref(false);
@@ -62,9 +63,12 @@ const DEFAULT_ENABLED_PLUGINS = ALL_PLUGIN_NAMES.filter(
   (n) => n !== "thepiratebay"
 );
 const settings = ref<UserSettings>({
-  enableTG: false,
-  tgChannels: "",
+  enabledTgChannels: [
+    ...((useRuntimeConfig().public as any).tgDefaultChannels || []),
+  ],
   enabledPlugins: [...DEFAULT_ENABLED_PLUGINS],
+  concurrency: 4,
+  pluginTimeoutMs: 5000,
 });
 const LS_KEY = "panhub.settings";
 
@@ -75,11 +79,24 @@ function loadSettings() {
     if (!raw) return;
     const parsed = JSON.parse(raw);
     const next: UserSettings = {
-      enableTG: !!parsed?.enableTG,
-      tgChannels: String(parsed?.tgChannels || ""),
+      enabledTgChannels: Array.isArray(parsed?.enabledTgChannels)
+        ? parsed.enabledTgChannels.filter((x: any) => typeof x === "string")
+        : [
+            ...(((useRuntimeConfig().public as any).tgDefaultChannels ||
+              []) as string[]),
+          ],
       enabledPlugins: Array.isArray(parsed?.enabledPlugins)
         ? parsed.enabledPlugins.filter((x: any) => typeof x === "string")
         : [...DEFAULT_ENABLED_PLUGINS],
+      concurrency:
+        typeof parsed?.concurrency === "number" && parsed.concurrency > 0
+          ? Math.min(16, Math.max(1, parsed.concurrency))
+          : 4,
+      pluginTimeoutMs:
+        typeof parsed?.pluginTimeoutMs === "number" &&
+        parsed.pluginTimeoutMs > 0
+          ? parsed.pluginTimeoutMs
+          : 5000,
     };
     next.enabledPlugins = next.enabledPlugins.filter((x) =>
       ALL_PLUGIN_NAMES.includes(x)
@@ -103,15 +120,14 @@ function resetToDefault() {
     try {
       localStorage.removeItem(LS_KEY);
     } catch {}
+    // 彻底恢复默认：刷新页面，让运行时默认与配置接管
+    window.location.reload();
   }
-  settings.value = {
-    enableTG: false,
-    tgChannels: "",
-    enabledPlugins: [...DEFAULT_ENABLED_PLUGINS],
-  };
 }
 
 onMounted(() => loadSettings());
+const TG_DEFAULT_CHANNELS = (useRuntimeConfig().public as any)
+  .tgDefaultChannels as string[];
 </script>
 
 <style>

@@ -44,18 +44,57 @@
       </section>
 
       <section class="drawer__section">
-        <label class="row">
-          <input type="checkbox" v-model="inner.enableTG" @change="saveTemp" />
-          <span>启用 TG 搜索</span>
-        </label>
-        <label class="block">
-          <span class="label">TG 频道(逗号分隔，可留空使用默认)</span>
-          <textarea
-            v-model="inner.tgChannels"
-            rows="3"
-            placeholder="alipanshare,tgxiazaiyuan"
-            @input="saveTemp"></textarea>
-        </label>
+        <div class="section__title">
+          <strong>频道来源</strong>
+          <div class="section__tools">
+            <button class="btn" @click="onSelectAllTg">全选</button>
+            <button class="btn" @click="onClearAllTg">全不选</button>
+          </div>
+        </div>
+        <div class="plugin-grid">
+          <label v-for="name in allTgChannels" :key="name" class="plugin-item">
+            <input
+              type="checkbox"
+              :value="name"
+              v-model="inner.enabledTgChannels"
+              @change="saveTemp" />
+            <span>{{ name }}</span>
+          </label>
+        </div>
+      </section>
+
+      <section class="drawer__section">
+        <div class="section__title"><strong>性能与并发</strong></div>
+        <div class="row" style="margin-bottom: 8px">
+          <label class="label" style="width: 120px">插件并发数</label>
+          <input
+            type="number"
+            min="1"
+            max="16"
+            v-model.number="inner.concurrency"
+            @change="saveTemp"
+            class="input"
+            :placeholder="String(DEFAULT_CONCURRENCY)"
+            :title="`默认 ${DEFAULT_CONCURRENCY}，范围 1-16`" />
+          <span style="font-size: 12px; color: #666"
+            >默认 {{ DEFAULT_CONCURRENCY }}，范围 1-16</span
+          >
+        </div>
+        <div class="row">
+          <label class="label" style="width: 120px">插件超时(ms)</label>
+          <input
+            type="number"
+            min="1000"
+            step="500"
+            v-model.number="inner.pluginTimeoutMs"
+            @change="saveTemp"
+            class="input"
+            :placeholder="String(DEFAULT_PLUGIN_TIMEOUT)"
+            :title="`默认 ${DEFAULT_PLUGIN_TIMEOUT} ms`" />
+          <span style="font-size: 12px; color: #666"
+            >默认 {{ DEFAULT_PLUGIN_TIMEOUT }} ms</span
+          >
+        </div>
       </section>
 
       <footer class="drawer__footer">
@@ -67,14 +106,16 @@
 
 <script setup lang="ts">
 interface UserSettings {
-  enableTG: boolean;
-  tgChannels: string;
+  enabledTgChannels: string[];
   enabledPlugins: string[];
+  concurrency: number;
+  pluginTimeoutMs: number;
 }
 const props = defineProps<{
   modelValue: UserSettings;
   open: boolean;
   allPlugins: string[];
+  allTgChannels: string[];
 }>();
 const emit = defineEmits([
   "update:modelValue",
@@ -84,10 +125,14 @@ const emit = defineEmits([
 ]);
 
 const inner = ref<UserSettings>({
-  enableTG: false,
-  tgChannels: "",
+  enabledTgChannels: [],
   enabledPlugins: [],
+  concurrency: 4,
+  pluginTimeoutMs: 5000,
 });
+
+const DEFAULT_CONCURRENCY = 4;
+const DEFAULT_PLUGIN_TIMEOUT = 5000;
 
 watch(
   () => props.modelValue,
@@ -114,6 +159,15 @@ function onClearAll() {
   inner.value.enabledPlugins = [];
   saveTemp();
 }
+
+function onSelectAllTg() {
+  inner.value.enabledTgChannels = [...props.allTgChannels];
+  saveTemp();
+}
+function onClearAllTg() {
+  inner.value.enabledTgChannels = [];
+  saveTemp();
+}
 </script>
 
 <style scoped>
@@ -132,6 +186,7 @@ function onClearAll() {
   padding: 14px 16px;
   display: flex;
   flex-direction: column;
+  overflow: auto;
 }
 .drawer__header {
   display: flex;
@@ -185,6 +240,14 @@ function onClearAll() {
   display: flex;
   align-items: center;
   gap: 8px;
+  min-width: 0; /* 允许内部省略号生效 */
+}
+.plugin-item span {
+  display: inline-block;
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 .btn {
   padding: 8px 12px;
