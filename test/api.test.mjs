@@ -7,6 +7,20 @@
 import { ofetch } from "ofetch";
 
 const API_BASE = process.env.API_BASE || "http://localhost:3000/api";
+const KW = process.env.KW || "1"; // 统一关键词：1
+const KW_LIST = (() => {
+  const raw = process.env.KW_LIST;
+  if (raw && raw.trim()) {
+    return raw
+      .split(",")
+      .map((s) => s.trim())
+      .filter(Boolean);
+  }
+  // 默认测试关键词列表：短词 + 常用英文/中文
+  const arr = [KW, "电影", "movie", "1080p"];
+  // 去重
+  return Array.from(new Set(arr));
+})();
 
 function log(...args) {
   console.log("[TEST]", ...args);
@@ -34,71 +48,123 @@ async function safeFetch(url, opts) {
 }
 
 async function testHealth() {
+  if (process.env.PLUGINS) {
+    log("[skip] health (PLUGINS specified)");
+    return;
+  }
   log("GET /health");
   const data = await safeFetch(`${API_BASE}/health`);
   expect(!!data, "health: response should not be null");
   if (!data) return;
-  expect(data.ok === true, "health: ok should be true");
+  expect(data.status === "ok", "health: status should be 'ok'");
   expect(
-    typeof data.pluginCount === "number",
-    "health: pluginCount should be number"
+    typeof data.plugin_count === "number",
+    "health: plugin_count should be number"
   );
   expect(Array.isArray(data.plugins), "health: plugins should be array");
 }
 
 async function testSearchGetPlugin() {
-  log("GET /search (plugin)");
-  const q = new URLSearchParams({
-    kw: "test",
-    src: "plugin",
-    res: "results",
-    plugins: "hunhepan",
-  });
-  const data = await safeFetch(`${API_BASE}/search?${q.toString()}`);
-  expect(!!data, "search GET plugin: response should not be null");
-  if (!data) return;
-  expect(data.ok === true, "search GET plugin: ok should be true");
-  expect(
-    data.data && typeof data.data.total === "number",
-    "search GET plugin: data.total should exist"
-  );
+  log(`GET /search (plugin, kw=${KW})`);
+  // 从 /health 动态获取全部插件名
+  let selected = process.env.PLUGINS
+    ? String(process.env.PLUGINS)
+        .split(",")
+        .map((s) => s.trim())
+        .filter(Boolean)
+    : [];
+  if (selected.length === 0) {
+    const health = await safeFetch(`${API_BASE}/health`);
+    const all = health && Array.isArray(health.plugins) ? health.plugins : [];
+    selected = all;
+  }
+  for (const name of selected) {
+    let ok = false;
+    for (const kw of KW_LIST) {
+      const q = new URLSearchParams({
+        kw,
+        src: "plugin",
+        res: "results",
+        plugins: name,
+        refresh: "true",
+        ext: JSON.stringify({ __plugin_timeout_ms: 6000, __detail_limit: 6 }),
+      });
+      const data = await safeFetch(`${API_BASE}/search?${q.toString()}`);
+      if (!data) {
+        err(`plugin:${name}: response null for kw=${kw}`);
+        continue;
+      }
+      if (data.code !== 0) {
+        err(`plugin:${name}: bad code(${data.code}) for kw=${kw}`);
+        continue;
+      }
+      const total = data?.data?.total || 0;
+      if (total > 0) {
+        ok = true;
+        log(`plugin:${name}: ok, kw=${kw}, total=${total}`);
+        break;
+      } else {
+        log(`plugin:${name}: empty for kw=${kw}`);
+      }
+    }
+    if (!ok) {
+      failures++;
+      err(`plugin:${name}: 所有关键词(${KW_LIST.join(", ")}) 均返回 0，需适配`);
+    }
+  }
 }
 
 async function testSearchGetAll() {
-  log("GET /search (all)");
+  if (process.env.PLUGINS) {
+    log("[skip] search all (PLUGINS specified)");
+    return;
+  }
+  log(`GET /search (all, kw=${KW})`);
   const q = new URLSearchParams({
-    kw: "test",
+    kw: KW,
     src: "all",
     res: "results",
     refresh: "true",
+    ext: JSON.stringify({ __plugin_timeout_ms: 6000, __detail_limit: 6 }),
   });
   const data = await safeFetch(`${API_BASE}/search?${q.toString()}`);
   expect(!!data, "search GET all: response should not be null");
   if (!data) return;
-  expect(data.ok === true, "search GET all: ok should be true");
-  expect(
-    data.data && typeof data.data.total === "number",
-    "search GET all: data.total should exist"
-  );
+  expect(data.code === 0, "search GET all: code should be 0");
+  const total = data?.data?.total || 0;
+  if (!(total > 0)) {
+    failures++;
+    err(`search GET all: 关键词(${KW}) 返回 0 条，接口可能需要重新适配`);
+  } else {
+    log(`search GET all: ok, total=${total}`);
+  }
 }
 
 async function testSearchPostTG() {
-  log("POST /search (tg)");
+  if (process.env.PLUGINS) {
+    log("[skip] search tg (PLUGINS specified)");
+    return;
+  }
+  log(`POST /search (tg, kw=${KW})`);
   const body = {
-    kw: "test",
+    kw: KW,
     src: "tg",
     res: "results",
     channels: "tgsearchers3",
     refresh: true,
+    ext: { __plugin_timeout_ms: 6000 },
   };
   const data = await safeFetch(`${API_BASE}/search`, { method: "POST", body });
   expect(!!data, "search POST tg: response should not be null");
   if (!data) return;
-  expect(data.ok === true, "search POST tg: ok should be true");
-  expect(
-    data.data && typeof data.data.total === "number",
-    "search POST tg: data.total should exist"
-  );
+  expect(data.code === 0, "search POST tg: code should be 0");
+  const total = data?.data?.total || 0;
+  if (!(total > 0)) {
+    failures++;
+    err(`search POST tg: 关键词(${KW}) 返回 0 条，接口可能需要重新适配`);
+  } else {
+    log(`search POST tg: ok, total=${total}`);
+  }
 }
 
 async function main() {

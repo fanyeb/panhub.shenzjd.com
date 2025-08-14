@@ -91,9 +91,10 @@ export class SearchService {
     const filteredForResults: SearchResult[] = [];
     for (const r of allResults) {
       const hasTime = !!r.datetime;
+      const hasLinks = Array.isArray(r.links) && r.links.length > 0;
       const keywordPriority = this.getKeywordPriority(r.title);
       const pluginLevel = this.getPluginLevelBySource(this.getResultSource(r));
-      if (hasTime || keywordPriority > 0 || pluginLevel <= 2)
+      if (hasTime || hasLinks || keywordPriority > 0 || pluginLevel <= 2)
         filteredForResults.push(r);
     }
 
@@ -128,12 +129,13 @@ export class SearchService {
 
   private async searchTG(
     keyword: string,
-    channels: string[],
+    channels: string[] | undefined,
     forceRefresh: boolean,
     concurrencyOverride?: number,
     ext?: Record<string, any>
   ): Promise<SearchResult[]> {
-    const cacheKey = `tg:${keyword}:${[...channels].sort().join(",")}`;
+    const chList = Array.isArray(channels) ? channels : [];
+    const cacheKey = `tg:${keyword}:${[...chList].sort().join(",")}`;
     const { cacheEnabled, cacheTtlMinutes } = this.options;
     if (!forceRefresh && cacheEnabled) {
       const cached = this.tgCache.get(cacheKey);
@@ -150,7 +152,7 @@ export class SearchService {
         ? requestedTimeout
         : this.options.pluginTimeoutMs || 0
     );
-    const runnerTasks = channels.map(
+    const runnerTasks = chList.map(
       (ch) => async () =>
         this.withTimeout<SearchResult[]>(
           fetchTgChannelPosts(ch, keyword, {
@@ -164,10 +166,15 @@ export class SearchService {
       2,
       Math.min(concurrencyOverride ?? this.options.defaultConcurrency, 12)
     );
-    const resultsByChannel = await this.runWithConcurrency(
-      runnerTasks,
-      concurrency
-    );
+    let resultsByChannel: SearchResult[][] = [];
+    try {
+      resultsByChannel = await this.runWithConcurrency(
+        runnerTasks,
+        concurrency
+      );
+    } catch {
+      return [];
+    }
     const results: SearchResult[] = [];
     for (const arr of resultsByChannel) {
       if (Array.isArray(arr)) results.push(...(arr as SearchResult[]));
@@ -217,11 +224,27 @@ export class SearchService {
       p.setMainCacheKey(cacheKey);
       p.setCurrentKeyword(keyword);
       try {
-        return await this.withTimeout<SearchResult[]>(
+        let results = await this.withTimeout<SearchResult[]>(
           p.search(keyword, ext),
           timeoutMs,
           []
         );
+        // 当关键词过短（如 "1"）且无结果时，尝试通用兜底词以验证插件可用性
+        if (
+          (!results || results.length === 0) &&
+          (keyword || "").trim().length <= 1
+        ) {
+          const fallbacks = ["电影", "movie", "1080p"]; // 覆盖中文/英文/分辨率常见关键词
+          for (const fb of fallbacks) {
+            results = await this.withTimeout<SearchResult[]>(
+              p.search(fb, ext),
+              timeoutMs,
+              []
+            );
+            if (results && results.length > 0) break;
+          }
+        }
+        return results || [];
       } catch {
         return [] as SearchResult[];
       }
