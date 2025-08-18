@@ -393,12 +393,14 @@ function resetSearch() {
 async function onSearch() {
   if (!kw.value || loading.value) return;
 
-  // iOS Safari兼容性：确保输入框失去焦点
+  // iOS Safari兼容性：确保输入框失去焦点并添加延迟
   if (
     typeof window !== "undefined" &&
     document.activeElement instanceof HTMLInputElement
   ) {
     document.activeElement.blur();
+    // 添加小延迟确保焦点处理完成
+    await new Promise((resolve) => setTimeout(resolve, 100));
   }
 
   // 每次搜索前读取最新设置，避免跨页面/跨组件状态不同步
@@ -616,7 +618,7 @@ onMounted(() => {
 
 <style scoped>
 .home {
-  max-width: 1100px;
+  max-width: 1200px;
   margin: 24px auto 0; /* 去掉底部 40px 外边距，初始不出现滚动条 */
   padding: 0 16px 16px;
 }
